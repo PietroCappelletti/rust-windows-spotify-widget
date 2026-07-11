@@ -87,8 +87,8 @@ cargo run --release
 - [x] Show/hide toggle via global hotkey
 - [x] System tray integration
 - [x] Spotify OAuth login with persisted sessions
-- [ ] Album art display
-- [ ] Reposition widget to bottom-right corner of the screen
+- [x] Album art display
+- [x] Reposition widget to top-right corner of the screen
 - [ ] Custom tray + app icon art
 - [ ] Configurable hotkey (currently hardcoded to `Ctrl+Shift+.`)
 - [ ] Automatic access token refresh on expiry (currently only refreshes on relaunch)
