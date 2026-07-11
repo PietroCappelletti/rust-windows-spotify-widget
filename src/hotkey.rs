@@ -1,15 +1,43 @@
-/// Registers the global hotkey (e.g. Ctrl+Shift+.) and notifies
-/// the app when it's pressed.
-pub struct HotkeyListener;
+use global_hotkey::{
+  hotkey::{Code, HotKey, Modifiers},
+  GlobalHotKeyEvent, GlobalHotKeyManager, HotKeyState,
+};
+
+/// Registers the global Ctrl+Shift+. hotkey and lets the app check
+/// whether it was just pressed. Works even when the app window is
+/// hidden or unfocused, since this hooks in at the OS level.
+pub struct HotkeyListener {
+  _manager: GlobalHotKeyManager,
+  hotkey_id: u32,
+}
 
 impl HotkeyListener {
-  /// Sets up the global hotkey and returns a listener handle.
   pub fn new() -> Self {
-    todo!("register global hotkey with the `global-hotkey` crate")
+    let manager =
+      GlobalHotKeyManager::new().expect("failed to create global hotkey manager");
+
+    let hotkey = HotKey::new(Some(Modifiers::CONTROL | Modifiers::SHIFT), Code::Period);
+    let hotkey_id = hotkey.id();
+
+    match manager.register(hotkey) {
+      Ok(_) => eprintln!("[hotkey] Registered Ctrl+Shift+. successfully (id={})", hotkey_id),
+      Err(e) => eprintln!("[hotkey] FAILED to register: {:?}", e),
+    }
+
+    Self {
+      _manager: manager,
+      hotkey_id,
+    }
   }
 
-  /// Returns true if the hotkey was just pressed (called each frame).
   pub fn was_pressed(&self) -> bool {
-    todo!("check hotkey event queue")
+    let mut pressed = false;
+    while let Ok(event) = GlobalHotKeyEvent::receiver().try_recv() {
+      eprintln!("[hotkey] Received event: id={}, state={:?}", event.id, event.state);
+      if event.id == self.hotkey_id && event.state == HotKeyState::Pressed {
+        pressed = true;
+      }
+    }
+    pressed
   }
 }
