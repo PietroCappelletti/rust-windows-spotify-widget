@@ -3,12 +3,11 @@ mod api;
 mod models;
 mod token_store;
 
-pub use models::Track;
+pub use models::{PlaybackState, Track};
 
 use std::time::{Duration, SystemTime};
 use tokio::sync::RwLock;
 
-// Refresh this many seconds *before* actual expiry, so we don't cut it too close.
 const REFRESH_BUFFER: Duration = Duration::from_secs(60);
 
 struct TokenState {
@@ -17,10 +16,9 @@ struct TokenState {
     expires_at: SystemTime,
 }
 
-/// High-level client for controlling Spotify playback. Handles automatic
-/// access-token refresh internally — callers never need to think about it.
 pub struct SpotifyClient {
     state: RwLock<TokenState>,
+    http_client: reqwest::Client,
     client_id: String,
     client_secret: String,
     redirect_uri: String,
@@ -64,14 +62,13 @@ impl SpotifyClient {
                 refresh_token: tokens.refresh_token,
                 expires_at: tokens.expires_at,
             }),
+            http_client: reqwest::Client::new(),
             client_id,
             client_secret,
             redirect_uri,
         })
     }
 
-    /// Returns a valid access token, transparently refreshing it first if
-    /// it's expired or about to expire within `REFRESH_BUFFER`.
     async fn ensure_fresh_token(&self) -> Result<String, String> {
         {
             let state = self.state.read().await;
@@ -85,18 +82,12 @@ impl SpotifyClient {
                 return Ok(state.access_token.clone());
             }
         }
-
-        // Token is expiring soon (or already expired) — refresh it.
         self.force_refresh().await
     }
 
-    /// Unconditionally refreshes the access token and persists the result.
-    /// Used both proactively (ensure_fresh_token) and reactively (on a 401).
     async fn force_refresh(&self) -> Result<String, String> {
         let mut state = self.state.write().await;
 
-        // Another task may have already refreshed while we waited for the
-        // write lock — re-check before hitting the network again.
         let still_expiring_soon = state
             .expires_at
             .checked_sub(REFRESH_BUFFER)
@@ -124,9 +115,6 @@ impl SpotifyClient {
         Ok(state.access_token.clone())
     }
 
-    /// Runs a Spotify API call, refreshing and retrying once if it fails
-    /// due to an expired/invalid token that our proactive check missed
-    /// (e.g. clock skew, or the token being revoked externally).
     async fn with_valid_token<T, F, Fut>(&self, call: F) -> Result<T, String>
     where
         F: Fn(String) -> Fut,
@@ -143,22 +131,26 @@ impl SpotifyClient {
     }
 
     pub async fn play(&self) -> Result<(), String> {
-        self.with_valid_token(|token| async move { api::play(&token).await }).await
+        self.with_valid_token(|token| async move { api::play(&self.http_client, &token).await }).await
     }
 
     pub async fn pause(&self) -> Result<(), String> {
-        self.with_valid_token(|token| async move { api::pause(&token).await }).await
+        self.with_valid_token(|token| async move { api::pause(&self.http_client, &token).await }).await
     }
 
     pub async fn next_track(&self) -> Result<(), String> {
-        self.with_valid_token(|token| async move { api::next(&token).await }).await
+        self.with_valid_token(|token| async move { api::next(&self.http_client, &token).await }).await
     }
 
     pub async fn previous_track(&self) -> Result<(), String> {
-        self.with_valid_token(|token| async move { api::previous(&token).await }).await
+        self.with_valid_token(|token| async move { api::previous(&self.http_client, &token).await }).await
     }
 
-    pub async fn get_current_track(&self) -> Result<Option<Track>, String> {
-        self.with_valid_token(|token| async move { api::current_playback(&token).await }).await
+    pub async fn set_volume(&self, volume_percent: u8) -> Result<(), String> {
+        self.with_valid_token(move |token| async move { api::set_volume(&self.http_client, &token, volume_percent).await }).await
+    }
+
+    pub async fn get_playback_state(&self) -> Result<PlaybackState, String> {
+        self.with_valid_token(|token| async move { api::playback_state(&self.http_client, &token).await }).await
     }
 }

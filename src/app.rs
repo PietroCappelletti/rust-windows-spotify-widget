@@ -3,21 +3,22 @@ use std::time::{Duration, Instant};
 
 use crate::config::Config;
 use crate::hotkey::HotkeyListener;
-use crate::spotify::{SpotifyClient, Track};
+use crate::spotify::{PlaybackState, SpotifyClient, Track};
 use crate::tray::{TrayCommand, TrayHandle};
 use crate::ui::{draw_widget, WidgetAction};
 
+const VOLUME_DEBOUNCE: Duration = Duration::from_millis(150);
+const VOLUME_SYNC_SUPPRESS: Duration = Duration::from_millis(2000);
 const OFFSCREEN_POS: egui::Pos2 = egui::pos2(-10000.0, -10000.0);
+pub const WINDOW_WIDTH: f32 = 280.0;
+pub const SCREEN_MARGIN: f32 = 20.0;
 const TRACK_POLL_INTERVAL: Duration = Duration::from_secs(3);
 
 enum SpotifyEvent {
-    TrackUpdated(Option<Track>),
+    PlaybackUpdated(PlaybackState),
     ActionFailed(String),
     AlbumArtLoaded { url: String, image: egui::ColorImage },
 }
-
-pub const WINDOW_WIDTH: f32 = 250.0;
-pub const SCREEN_MARGIN: f32 = 16.0;
 
 pub struct WidgetApp {
     visible: bool,
@@ -28,12 +29,16 @@ pub struct WidgetApp {
     runtime: tokio::runtime::Runtime,
     spotify: Arc<SpotifyClient>,
     current_track: Option<Track>,
+    current_volume: Option<u8>,
     last_error: Option<String>,
     event_tx: mpsc::Sender<SpotifyEvent>,
     event_rx: mpsc::Receiver<SpotifyEvent>,
     album_texture: Option<egui::TextureHandle>,
     album_texture_url: Option<String>,
     marquee_start: Instant,
+    pending_volume: Option<u8>,
+    last_volume_sent_at: Instant,
+    suppress_volume_sync_until: Instant,
 }
 
 impl WidgetApp {
@@ -57,27 +62,31 @@ impl WidgetApp {
             runtime,
             spotify,
             current_track: None,
+            current_volume: None,
             last_error: None,
             event_tx,
             event_rx,
             album_texture: None,
             album_texture_url: None,
             marquee_start: Instant::now(),
+            pending_volume: None,
+            last_volume_sent_at: Instant::now() - VOLUME_DEBOUNCE, // allow an immediate first send
+            suppress_volume_sync_until: Instant::now(),
         };
 
         app.spawn_track_polling_loop();
         app
     }
 
-    fn spawn_track_polling_loop(&self) {
+        fn spawn_track_polling_loop(&self) {
         let spotify = self.spotify.clone();
         let tx = self.event_tx.clone();
 
         self.runtime.spawn(async move {
             loop {
-                match spotify.get_current_track().await {
-                    Ok(track) => {
-                        let _ = tx.send(SpotifyEvent::TrackUpdated(track));
+                match spotify.get_playback_state().await {
+                    Ok(state) => {
+                        let _ = tx.send(SpotifyEvent::PlaybackUpdated(state));
                     }
                     Err(e) => {
                         let _ = tx.send(SpotifyEvent::ActionFailed(e));
@@ -102,13 +111,27 @@ impl WidgetApp {
                 return;
             }
             tokio::time::sleep(Duration::from_millis(300)).await;
-            match spotify.get_current_track().await {
-                Ok(track) => {
-                    let _ = tx.send(SpotifyEvent::TrackUpdated(track));
+            match spotify.get_playback_state().await {
+                Ok(state) => {
+                    let _ = tx.send(SpotifyEvent::PlaybackUpdated(state));
                 }
                 Err(e) => {
                     let _ = tx.send(SpotifyEvent::ActionFailed(e));
                 }
+            }
+        });
+    }
+
+    /// Volume changes skip the "refetch full state after" step that other
+    /// actions use — the slider already shows the value the user set, and
+    /// refetching on every drag tick would spam the API.
+    fn spawn_volume_change(&self, volume_percent: u8) {
+        let spotify = self.spotify.clone();
+        let tx = self.event_tx.clone();
+
+        self.runtime.spawn(async move {
+            if let Err(e) = spotify.set_volume(volume_percent).await {
+                let _ = tx.send(SpotifyEvent::ActionFailed(e));
             }
         });
     }
@@ -156,7 +179,34 @@ impl WidgetApp {
             WidgetAction::Pause => self.spawn_action(|c| async move { c.pause().await }),
             WidgetAction::Next => self.spawn_action(|c| async move { c.next_track().await }),
             WidgetAction::Previous => self.spawn_action(|c| async move { c.previous_track().await }),
+            WidgetAction::SetVolume(v) => {
+                self.current_volume = Some(v);
+                self.suppress_volume_sync_until = Instant::now() + VOLUME_SYNC_SUPPRESS;
+
+                let now = Instant::now();
+                if now.duration_since(self.last_volume_sent_at) >= VOLUME_DEBOUNCE {
+                    self.last_volume_sent_at = now;
+                    self.pending_volume = None;
+                    self.spawn_volume_change(v);
+                } else {
+                    // Too soon since the last network call — remember this
+                    // as the value to send once the debounce window passes,
+                    // so the final position while dragging still lands.
+                    self.pending_volume = Some(v);
+                }
+            }
             WidgetAction::None => {}
+        }
+    }
+
+    fn flush_pending_volume(&mut self) {
+        if let Some(v) = self.pending_volume {
+            let now = Instant::now();
+            if now.duration_since(self.last_volume_sent_at) >= VOLUME_DEBOUNCE {
+                self.last_volume_sent_at = now;
+                self.pending_volume = None;
+                self.spawn_volume_change(v);
+            }
         }
     }
 
@@ -165,9 +215,9 @@ impl WidgetApp {
     fn drain_events(&mut self, ctx: &egui::Context) {
         while let Ok(event) = self.event_rx.try_recv() {
             match event {
-                SpotifyEvent::TrackUpdated(track) => {
-                    let new_art_url = track.as_ref().and_then(|t| t.album_art_url.clone());
-                    let new_name = track.as_ref().map(|t| t.name.clone());
+                SpotifyEvent::PlaybackUpdated(state) => {
+                    let new_art_url = state.track.as_ref().and_then(|t| t.album_art_url.clone());
+                    let new_name = state.track.as_ref().map(|t| t.name.clone());
                     let old_name = self.current_track.as_ref().map(|t| t.name.clone());
 
                     if new_name != old_name {
@@ -182,15 +232,18 @@ impl WidgetApp {
                         }
                     }
 
-                    self.current_track = track;
+                    self.current_track = state.track;
+                    if Instant::now() >= self.suppress_volume_sync_until {
+                        if let Some(v) = state.volume_percent {
+                            self.current_volume = Some(v);
+                        }
+                    }
                     self.last_error = None;
                 }
                 SpotifyEvent::ActionFailed(e) => {
                     self.last_error = Some(e);
                 }
                 SpotifyEvent::AlbumArtLoaded { url, image } => {
-                    // Guard against a slow download landing after the track
-                    // (and thus the art) has already changed again.
                     if self.album_texture_url.as_deref() == Some(url.as_str()) {
                         self.album_texture =
                             Some(ctx.load_texture("album_art", image, egui::TextureOptions::default()));
@@ -206,12 +259,8 @@ impl WidgetApp {
             let target_pos = ctx
                 .input(|i| i.viewport().monitor_size)
                 .map(|monitor_size| {
-                    egui::pos2(
-                        monitor_size.x - WINDOW_WIDTH - SCREEN_MARGIN,
-                        SCREEN_MARGIN,
-                    )
+                    egui::pos2(monitor_size.x - WINDOW_WIDTH - SCREEN_MARGIN, SCREEN_MARGIN)
                 })
-                // Fallback if monitor size isn't reported yet (e.g. very first frame).
                 .unwrap_or_else(|| egui::pos2(100.0, 100.0));
 
             ctx.send_viewport_cmd(egui::ViewportCommand::OuterPosition(target_pos));
@@ -235,6 +284,8 @@ impl WidgetApp {
 
 impl eframe::App for WidgetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
+
         if self.hotkey.was_pressed() {
             self.toggle_visibility(ctx);
         }
@@ -246,6 +297,7 @@ impl eframe::App for WidgetApp {
         }
 
         self.drain_events(ctx);
+        self.flush_pending_volume();
         self.check_auto_hide(ctx);
 
         if self.visible {
@@ -255,6 +307,7 @@ impl eframe::App for WidgetApp {
                 self.last_error.as_deref(),
                 self.album_texture.as_ref(),
                 self.marquee_start,
+                self.current_volume,
             );
             if !matches!(action, WidgetAction::None) {
                 self.last_interaction = Instant::now();
@@ -266,11 +319,6 @@ impl eframe::App for WidgetApp {
             }
         }
 
-        let repaint_interval = if self.visible {
-            Duration::from_millis(33) // ~30 FPS while visible, for smooth marquee scrolling
-        } else {
-            Duration::from_millis(200) // coarser while hidden, just enough to catch hotkey/tray events
-        };
-        ctx.request_repaint_after(repaint_interval);
+        ctx.request_repaint_after(Duration::from_millis(33));
     }
 }
