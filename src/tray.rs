@@ -23,7 +23,7 @@ pub struct TrayHandle {
 
 impl TrayHandle {
   pub fn new() -> Self {
-    let icon = build_placeholder_icon();
+    let icon = build_app_icon();
 
     let menu = Menu::new();
     let toggle_item = MenuItem::new("Show/Hide Widget", true, None);
@@ -69,11 +69,8 @@ impl TrayHandle {
 /// Builds a flat-color placeholder icon (32x32, Spotify green) so we
 /// don't depend on an image asset yet. Swap this out for a real
 /// `.ico`/`.png` loaded via `include_bytes!` once you have one.
-fn build_placeholder_icon() -> Icon {
-  const SIZE: u32 = 32;
-  let mut rgba = Vec::with_capacity((SIZE * SIZE * 4) as usize);
-  for _ in 0..(SIZE * SIZE) {
-    rgba.extend_from_slice(&[30, 215, 96, 255]); // R, G, B, A
-  }
-  Icon::from_rgba(rgba, SIZE, SIZE).expect("failed to build tray icon from rgba data")
+fn build_app_icon() -> Icon {
+    const SIZE: u32 = 32;
+    let rgba = rust_windows_spotify_widget::icon::generate_icon_rgba(SIZE);
+    Icon::from_rgba(rgba, SIZE, SIZE).expect("failed to build tray icon from rgba data")
 }

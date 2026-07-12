@@ -21,3 +21,6 @@ target
 
 # Added by cargo
 /target
+
+# Inno Setup output
+installer_output/

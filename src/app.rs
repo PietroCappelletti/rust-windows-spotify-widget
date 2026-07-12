@@ -17,7 +17,6 @@ enum SpotifyEvent {
 }
 
 pub const WINDOW_WIDTH: f32 = 250.0;
-pub const WINDOW_HEIGHT: f32 = 76.0;
 pub const SCREEN_MARGIN: f32 = 16.0;
 
 pub struct WidgetApp {
