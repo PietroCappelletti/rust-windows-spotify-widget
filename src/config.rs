@@ -1,11 +1,14 @@
 use std::env;
+use std::fs;
+use crate::hotkey::HotkeyAction;
+use std::collections::HashMap;
 
 pub struct Config {
     pub spotify_client_id: String,
     pub spotify_client_secret: String,
     pub spotify_redirect_uri: String,
     pub auto_hide_seconds: u64,
-    pub hotkey_combo: String,
+    pub hotkey_combos: HashMap<HotkeyAction, Option<String>>,
 }
 
 impl Config {
@@ -28,15 +31,50 @@ impl Config {
             .and_then(|v| v.parse().ok())
             .unwrap_or(6);
 
-        let hotkey_combo = env::var("HOTKEY_COMBO")
-            .unwrap_or_else(|_| "ctrl+shift+period".to_string());
+        let mut hotkey_combos = HashMap::new();
+        hotkey_combos.insert(
+            HotkeyAction::ToggleVisibility,
+            Some(env::var("HOTKEY_COMBO").unwrap_or_else(|_| "ctrl+shift+period".to_string())),
+        );
+        hotkey_combos.insert(HotkeyAction::PlayPause, env::var("HOTKEY_PLAY_PAUSE").ok());
+        hotkey_combos.insert(HotkeyAction::Next, env::var("HOTKEY_NEXT").ok());
+        hotkey_combos.insert(HotkeyAction::Previous, env::var("HOTKEY_PREVIOUS").ok());
 
         Ok(Self {
             spotify_client_id,
             spotify_client_secret,
             spotify_redirect_uri,
             auto_hide_seconds,
-            hotkey_combo,
+            hotkey_combos,
         })
     }
+}
+
+/// Updates (or adds) a single KEY=value line in the local `.env` file.
+fn save_env_var(key: &str, value: &str) -> Result<(), String> {
+    let path = ".env";
+    let existing = fs::read_to_string(path).unwrap_or_default();
+
+    let mut found = false;
+    let mut new_lines: Vec<String> = existing
+        .lines()
+        .map(|line| {
+            if line.trim_start().starts_with(&format!("{key}=")) {
+                found = true;
+                format!("{key}={value}")
+            } else {
+                line.to_string()
+            }
+        })
+        .collect();
+
+    if !found {
+        new_lines.push(format!("{key}={value}"));
+    }
+
+    fs::write(path, new_lines.join("\n") + "\n").map_err(|e| e.to_string())
+}
+
+pub fn save_hotkey_combo(action: HotkeyAction, combo: &str) -> Result<(), String> {
+    save_env_var(action.env_key(), combo)
 }

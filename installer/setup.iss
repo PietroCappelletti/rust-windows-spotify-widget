@@ -1,5 +1,5 @@
 #define MyAppName "Spotify Widget"
-#define MyAppVersion "0.1.0"
+#define MyAppVersion "0.2.0"
 #define MyAppPublisher "Pietro Cappelletti"
 #define MyAppExeName "rust-windows-spotify-widget.exe"
 #define MyAppURL "https://github.com/PietroCappelletti/rust-windows-spotify-widget"
@@ -31,6 +31,7 @@ Name: "startupicon"; Description: "Launch automatically when Windows starts"; Gr
 [Files]
 Source: "..\target\release\{#MyAppExeName}"; DestDir: "{app}"; Flags: ignoreversion
 Source: "..\.env.example"; DestDir: "{app}"; DestName: ".env.example"; Flags: ignoreversion
+Source: "..\.env.example"; DestDir: "{app}"; DestName: ".env"; Flags: ignoreversion onlyifdoesntexist
 Source: "..\README.md"; DestDir: "{app}"; Flags: ignoreversion
 
 [Icons]
@@ -43,4 +44,4 @@ Name: "{userstartup}\{#MyAppName}"; Filename: "{app}\{#MyAppExeName}"; Tasks: st
 Filename: "{app}\{#MyAppExeName}"; Description: "Launch {#MyAppName} now"; Flags: nowait postinstall skipifsilent
 
 [Messages]
-FinishedLabel=Setup has installed {#MyAppName}.%n%nBefore first use, copy %n{app}\.env.example%nto%n{app}\.env%nand fill in your own Spotify Client ID/Secret — see the bundled README.md for the full setup steps.
+FinishedLabel=Setup has installed {#MyAppName}.%n%nBefore first use, open %n{app}\.env%nand fill in your own Spotify Client ID/Secret — see the bundled README.md for the full setup steps.

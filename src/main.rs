@@ -47,7 +47,7 @@ fn main() -> eframe::Result<()> {
 
     let start_visible = false;
 
-    let hotkey = HotkeyListener::new(&config.hotkey_combo);
+    let hotkey = HotkeyListener::new(&config.hotkey_combos);
     let tray = TrayHandle::new();
 
     let runtime = tokio::runtime::Runtime::new().expect("failed to create tokio runtime");

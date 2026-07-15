@@ -6,13 +6,20 @@ use crate::hotkey::HotkeyListener;
 use crate::spotify::{PlaybackState, SpotifyClient, Track};
 use crate::tray::{TrayCommand, TrayHandle};
 use crate::ui::{draw_widget, WidgetAction};
+use crate::hotkey::HotkeyAction;
 
 const VOLUME_DEBOUNCE: Duration = Duration::from_millis(150);
 const VOLUME_SYNC_SUPPRESS: Duration = Duration::from_millis(2000);
 const OFFSCREEN_POS: egui::Pos2 = egui::pos2(-10000.0, -10000.0);
-pub const WINDOW_WIDTH: f32 = 280.0;
+pub const WINDOW_WIDTH: f32 = 290.0;
 pub const SCREEN_MARGIN: f32 = 20.0;
 const TRACK_POLL_INTERVAL: Duration = Duration::from_secs(3);
+
+#[derive(Default)]
+struct SettingsState {
+    recording_action: Option<HotkeyAction>,
+    status: Option<String>,
+}
 
 enum SpotifyEvent {
     PlaybackUpdated(PlaybackState),
@@ -39,6 +46,8 @@ pub struct WidgetApp {
     pending_volume: Option<u8>,
     last_volume_sent_at: Instant,
     suppress_volume_sync_until: Instant,
+    settings_open: bool,
+    settings: SettingsState,
 }
 
 impl WidgetApp {
@@ -72,6 +81,8 @@ impl WidgetApp {
             pending_volume: None,
             last_volume_sent_at: Instant::now() - VOLUME_DEBOUNCE, // allow an immediate first send
             suppress_volume_sync_until: Instant::now(),
+            settings_open: false,
+            settings: SettingsState::default(),
         };
 
         app.spawn_track_polling_loop();
@@ -286,12 +297,25 @@ impl eframe::App for WidgetApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         ctx.send_viewport_cmd(egui::ViewportCommand::WindowLevel(egui::WindowLevel::AlwaysOnTop));
 
-        if self.hotkey.was_pressed() {
-            self.toggle_visibility(ctx);
+        for action in self.hotkey.poll_actions() {
+            match action {
+                HotkeyAction::ToggleVisibility => self.toggle_visibility(ctx),
+                HotkeyAction::PlayPause => {
+                    let is_playing = self.current_track.as_ref().map(|t| t.is_playing).unwrap_or(false);
+                    if is_playing {
+                        self.spawn_action(|c| async move { c.pause().await });
+                    } else {
+                        self.spawn_action(|c| async move { c.play().await });
+                    }
+                }
+                HotkeyAction::Next => self.spawn_action(|c| async move { c.next_track().await }),
+                HotkeyAction::Previous => self.spawn_action(|c| async move { c.previous_track().await }),
+            }
         }
 
-        match self.tray.poll() {
+         match self.tray.poll() {
             TrayCommand::ToggleVisibility => self.toggle_visibility(ctx),
+            TrayCommand::OpenSettings => self.settings_open = true,
             TrayCommand::Quit => std::process::exit(0),
             TrayCommand::None => {}
         }
@@ -319,6 +343,161 @@ impl eframe::App for WidgetApp {
             }
         }
 
+        if self.settings_open {
+            let mut close_requested = false;
+
+            ctx.show_viewport_immediate(
+                egui::ViewportId::from_hash_of("settings_window"),
+                egui::ViewportBuilder::default()
+                    .with_title("Spotify Widget — Settings")
+                    .with_inner_size([360.0, 260.0])
+                    .with_resizable(false),
+                |settings_ctx, _class| {
+                    egui::CentralPanel::default().show(settings_ctx, |ui| {
+                        ui.heading("Hotkeys");
+                        ui.add_space(4.0);
+
+                        for action in HotkeyAction::ALL {
+                            ui.horizontal(|ui| {
+                                ui.label(action.label());
+                                ui.monospace(self.hotkey.combo_for(action).unwrap_or("Not set"));
+
+                                if self.settings.recording_action == Some(action) {
+                                    ui.colored_label(egui::Color32::YELLOW, "Press keys...");
+                                } else {
+                                    if ui.button("Change").clicked() {
+                                        self.settings.recording_action = Some(action);
+                                        self.settings.status = None;
+                                    }
+                                    if !action.required() && ui.button("Clear").clicked() {
+                                        match self.hotkey.update_combo(action, "") {
+                                            Ok(()) => {
+                                                let _ = crate::config::save_hotkey_combo(action, "");
+                                                self.settings.status = Some(format!("{}: cleared", action.label()));
+                                            }
+                                            Err(e) => self.settings.status = Some(e),
+                                        }
+                                    }
+                                }
+                            });
+                        }
+
+                        if let Some(action) = self.settings.recording_action {
+                            ui.add_space(4.0);
+                            ui.colored_label(
+                                egui::Color32::YELLOW,
+                                format!("Recording '{}'... press a combo (Esc to cancel)", action.label()),
+                            );
+
+                            let mut cancel = false;
+                            let mut captured: Option<(egui::Modifiers, egui::Key)> = None;
+
+                            settings_ctx.input(|i| {
+                                for event in &i.events {
+                                    if let egui::Event::Key { key, physical_key, pressed: true, modifiers, .. } = event {
+                                        if *key == egui::Key::Escape {
+                                            cancel = true;
+                                        } else {
+                                            // Use the physical key (actual key position) rather
+                                            // than the logical key, since holding Shift can remap
+                                            // the logical key to a different character/key
+                                            // depending on layout — the physical position is
+                                            // what we actually want for a hotkey binding.
+                                            let effective_key = physical_key.unwrap_or(*key);
+                                            captured = Some((*modifiers, effective_key));
+                                        }
+                                    }
+                                }
+                            });
+
+                            if cancel {
+                                self.settings.recording_action = None;
+                            } else if let Some((modifiers, key)) = captured {
+                                if !(modifiers.ctrl || modifiers.shift || modifiers.alt) {
+                                    self.settings.status =
+                                        Some("Include at least one of Ctrl, Shift, or Alt.".to_string());
+                                } else {
+                                    match build_combo_string(modifiers, key) {
+                                        Some(combo) => {
+                                            match self.hotkey.update_combo(action, &combo) {
+                                                Ok(()) => {
+                                                    let _ = crate::config::save_hotkey_combo(action, &combo);
+                                                    self.settings.status =
+                                                        Some(format!("{}: saved {combo}", action.label()));
+                                                }
+                                                Err(e) => self.settings.status = Some(e),
+                                            }
+                                            self.settings.recording_action = None;
+                                        }
+                                        None => {
+                                            self.settings.status = Some(
+                                                "That key isn't supported — try a letter, number, or function key."
+                                                    .to_string(),
+                                            );
+                                        }
+                                    }
+                                }
+                            }
+                        }
+
+                        if let Some(status) = &self.settings.status {
+                            ui.add_space(6.0);
+                            ui.label(status);
+                        }
+
+                        ui.add_space(12.0);
+                        ui.separator();
+                        if ui.button("Close").clicked() {
+                            close_requested = true;
+                        }
+                    });
+
+                    if settings_ctx.input(|i| i.viewport().close_requested()) {
+                        close_requested = true;
+                    }
+                },
+            );
+
+            if close_requested {
+                self.settings_open = false;
+                self.settings.recording_action = None;
+            }
+        }
+
         ctx.request_repaint_after(Duration::from_millis(33));
     }
+}
+
+/// Maps an egui key press + modifiers into a string the `global-hotkey`
+/// crate's parser understands (e.g. "ctrl+shift+KeyS"). Only covers keys
+/// safe/sensible for a global hotkey; returns None for anything else.
+fn build_combo_string(modifiers: egui::Modifiers, key: egui::Key) -> Option<String> {
+    use egui::Key::*;
+    let code = match key {
+        A => "KeyA", B => "KeyB", C => "KeyC", D => "KeyD", E => "KeyE", F => "KeyF",
+        G => "KeyG", H => "KeyH", I => "KeyI", J => "KeyJ", K => "KeyK", L => "KeyL",
+        M => "KeyM", N => "KeyN", O => "KeyO", P => "KeyP", Q => "KeyQ", R => "KeyR",
+        S => "KeyS", T => "KeyT", U => "KeyU", V => "KeyV", W => "KeyW", X => "KeyX",
+        Y => "KeyY", Z => "KeyZ",
+        Num0 => "Digit0", Num1 => "Digit1", Num2 => "Digit2", Num3 => "Digit3", Num4 => "Digit4",
+        Num5 => "Digit5", Num6 => "Digit6", Num7 => "Digit7", Num8 => "Digit8", Num9 => "Digit9",
+        F1 => "F1", F2 => "F2", F3 => "F3", F4 => "F4", F5 => "F5", F6 => "F6",
+        F7 => "F7", F8 => "F8", F9 => "F9", F10 => "F10", F11 => "F11", F12 => "F12",
+        ArrowUp => "ArrowUp", ArrowDown => "ArrowDown", ArrowLeft => "ArrowLeft", ArrowRight => "ArrowRight",
+        Enter => "Enter", Space => "Space", Tab => "Tab", Backspace => "Backspace",
+        Insert => "Insert", Delete => "Delete", Home => "Home", End => "End",
+        PageUp => "PageUp", PageDown => "PageDown",
+        Minus => "Minus", Period => "Period", Comma => "Comma", Slash => "Slash",
+        Backslash => "Backslash", Semicolon => "Semicolon", Quote => "Quote",
+        OpenBracket => "BracketLeft", CloseBracket => "BracketRight", Equals => "Equal",
+        _ => return None,
+    };
+
+    let mut parts = Vec::new();
+    if modifiers.ctrl { parts.push("ctrl"); }
+    if modifiers.shift { parts.push("shift"); }
+    if modifiers.alt { parts.push("alt"); }
+    parts.push(code);
+
+    Some(parts.join("+"))
 }
